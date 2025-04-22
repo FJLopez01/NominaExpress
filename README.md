@@ -13,8 +13,6 @@ Este proyecto automatiza el envío de recibos de nómina a los colaboradores de 
 
 ## 📁 Estructura del proyecto
 
-
-
 ```
 automated-payroll-dispatcher/
 ├── src/
@@ -33,6 +31,22 @@ automated-payroll-dispatcher/
 └── README.md
 ```
 
+## ⚙️ Uso
 
+1. Clona este repositorio:
+```bash
+git clone https://github.com/tuusuario/NominaExpress.git
+cd NominaExpress
+```
+2. Instala las dependencias:
+```bash
+pip install -r requirements.txt
+```
+3. Crea un archivo .env basado en .env.example y añade tus datos.
+
+4. Ejecuta el script principal:
+```bash
+python src/main.py
+```
 
 
