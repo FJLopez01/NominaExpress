@@ -1,6 +1,6 @@
 # NominaExpress
 
-# 📤 Automatización de Envío de Nóminas
+## 📤 Automatización de Envío de Nóminas
 
 Este proyecto automatiza el envío de recibos de nómina a los colaboradores de una empresa, adjuntando los archivos XML y PDF correspondientes, basándose en su CURP y nombre.
 
