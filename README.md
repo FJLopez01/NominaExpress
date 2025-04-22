@@ -14,7 +14,7 @@ Este proyecto automatiza el envío de recibos de nómina a los colaboradores de 
 ## 📁 Estructura del proyecto
 
 ```
-automated-payroll-dispatcher/
+NominaExpress/
 ├── src/
 │   ├── main.py                   # Script principal
 │   ├── config.py                 # Variables de entorno y rutas
