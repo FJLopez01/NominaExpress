@@ -55,7 +55,7 @@ SMTP_PORT=587
 
 # Ruta base donde están las carpetas XML, PDFs y Excel
 BASE_PATH=C:\ruta\a\tu\carpeta\Nominas
-
+```
 
 5. Ejecuta el script principal:
 ```bash
