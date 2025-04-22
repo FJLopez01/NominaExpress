@@ -44,9 +44,23 @@ pip install -r requirements.txt
 ```
 3. Crea un archivo .env basado en .env.example y añade tus datos.
 
-4. Ejecuta el script principal:
+### ✅ `.env.example`
+
+```env
+# Credenciales del correo
+EMAIL_SENDER=tuemail@gmail.com
+EMAIL_PASSWORD=tu_contraseña_de_aplicación
+SMTP_SERVER=smtp.gmail.com
+SMTP_PORT=587
+
+# Ruta base donde están las carpetas XML, PDFs y Excel
+BASE_PATH=C:\ruta\a\tu\carpeta\Nominas
+
+
+5. Ejecuta el script principal:
 ```bash
 python src/main.py
 ```
+
 
 
