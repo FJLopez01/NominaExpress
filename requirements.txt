@@ -1,5 +1,22 @@
+# ============================================================
+# Dependencias del Sistema de Nóminas Automático
+# ============================================================
+# Instalar con:
+#   pip install -r requirements.txt
+
+# Interfaz web
 streamlit>=1.28.0
+
+# Procesamiento de datos
 pandas>=1.5.0
-openpyxl>=3.1.0
-PyPDF2>=2.12.0
-lxml>=4.9.0
+openpyxl>=3.1.0       # Motor de lectura/escritura de archivos .xlsx
+
+# Procesamiento de archivos
+PyPDF2>=2.12.0        # Extracción de texto de PDFs
+lxml>=4.9.0           # Parser XML de alto rendimiento
+
+# Configuración y seguridad
+python-dotenv>=1.0.0  # Carga de variables de entorno desde .env
+
+# Testing
+pytest>=7.4.0

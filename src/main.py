@@ -1,41 +1,75 @@
-import os
-from config import XML_PATH, PDF_PATH
-from procesador import leer_correos_excel, extraer_datos_xml, buscar_pdf_por_curp
-from utilidades import limpiar_nombre, normalizar_nombre_para_busqueda
-from correo import enviar_correo
-
-correos_por_nombre = leer_correos_excel()
-
-for xml_file in os.listdir(XML_PATH):
-    if not xml_file.endswith(".xml"):
-        continue
-
-    xml_path = os.path.join(XML_PATH, xml_file)
-    nombre, curp = extraer_datos_xml(xml_path)
-    if not nombre or not curp:
-        continue
-
-    nombre_limpio = limpiar_nombre(nombre)
-    pdf_path, original_pdf = buscar_pdf_por_curp(curp)
-
-    if pdf_path:
-        nuevo_nombre = f"{nombre_limpio}-{curp}.pdf"
-        nuevo_path = os.path.join(PDF_PATH, nuevo_nombre)
-
-        if not os.path.exists(nuevo_path):
-            os.rename(pdf_path, nuevo_path)
-            print(f"📄 Renombrado: {original_pdf} -> {nuevo_nombre}")
-
-        # Enviar correo
-        clave = normalizar_nombre_para_busqueda(nombre)
-        correo = correos_por_nombre.get(clave)
-
-        if correo:
-            asunto = f"Recibo de Nómina - {nombre}"
-            cuerpo = f"""Estimado(a): {nombre}, 
-
-Por medio del presente reciba un cordial saludo y al mismo tiempo enviamos en archivo adjunto el CFDI con el formato electrónico XML(s) de las remuneraciones cubiertas en el período indicado en el título del correo.
 """
-            enviar_correo(correo, asunto, cuerpo, [xml_path, nuevo_path])
-        else:
-            print(f"⚠️ Correo no encontrado para: {nombre}")
+main.py — Modo CLI para procesamiento de nóminas.
+
+Uso:
+    python main.py
+
+Alternativa recomendada para uso diario:
+    streamlit run app.py
+"""
+
+from procesador import (
+    EstadoNomina,
+    ResultadoNomina,
+    construir_indice_pdfs,
+    ejecutar_procesamiento,
+    leer_correos_excel,
+)
+
+
+def on_progreso(procesados: int, total: int, resultado: ResultadoNomina) -> None:
+    """Imprime el progreso en consola después de cada XML."""
+    icono = "✅" if resultado.exitoso else ("⚠️" if resultado.estado in {
+        EstadoNomina.PDF_NO_ENCONTRADO,
+        EstadoNomina.CORREO_NO_ENCONTRADO,
+    } else "❌")
+    print(f"  [{procesados}/{total}] {icono} {resultado.mensaje}")
+
+
+def main() -> None:
+    # ------------------------------------------------------------------
+    # 1. Cargar datos — una sola vez antes del procesamiento
+    # ------------------------------------------------------------------
+    print("📧 Cargando base de correos...")
+    correos_por_nombre = leer_correos_excel()
+    print(f"   {len(correos_por_nombre)} registros cargados.")
+
+    print("📂 Indexando PDFs...")
+    indice_pdfs = construir_indice_pdfs()
+    print(f"   {len(indice_pdfs)} PDFs indexados.")
+
+    # ------------------------------------------------------------------
+    # 2. Ejecutar procesamiento — lógica pura en procesador.py
+    # ------------------------------------------------------------------
+    print("\n🚀 Iniciando procesamiento...\n")
+
+    resultados = ejecutar_procesamiento(correos_por_nombre, indice_pdfs, on_progreso)
+
+    # ------------------------------------------------------------------
+    # 3. Detectar error fatal
+    # ------------------------------------------------------------------
+    if any(r.estado == EstadoNomina.ERROR_SMTP_AUTH for r in resultados):
+        print("\n🔐 Error de autenticación con Gmail.")
+        print("   Verifica EMAIL_SENDER y EMAIL_PASSWORD en tu archivo .env")
+        raise SystemExit(1)
+
+    # ------------------------------------------------------------------
+    # 4. Resumen final
+    # ------------------------------------------------------------------
+    total    = len(resultados)
+    exitosos = sum(1 for r in resultados if r.exitoso)
+    errores  = total - exitosos
+
+    print(f"\n{'─' * 40}")
+    print(f"📊 Resumen:")
+    print(f"   Total:       {total}")
+    print(f"   ✅ Exitosos: {exitosos}")
+    print(f"   ❌ Errores:  {errores}")
+    print(f"{'─' * 40}")
+
+    if errores > 0:
+        raise SystemExit(1)  # Exit code no-cero para scripts/CI
+
+
+if __name__ == "__main__":
+    main()
