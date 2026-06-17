@@ -1,4 +1,4 @@
-# 💼 Sistema de Nóminas — AGD Legal
+# 💼 Sistema de Envío de Nominas
 
 Sistema automatizado para el procesamiento y envío de recibos de nómina por correo electrónico. Lee archivos XML (CFDI 4.0 del SAT), los vincula con sus PDFs correspondientes por CURP, y envía ambos archivos al correo de cada empleado usando Microsoft 365.
 
