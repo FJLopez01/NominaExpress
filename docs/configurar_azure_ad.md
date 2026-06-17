@@ -192,4 +192,4 @@ Debe ser una cuenta dentro de tu tenant de M365
 | AZURE_TENANT_ID      | Paso 3 de esta guía             | 12345678-1234-1234-1234-123456789012 |
 | AZURE_CLIENT_ID      | Paso 3 de esta guía             | 87654321-4321-4321-4321-210987654321 |
 | AZURE_CLIENT_SECRET  | Paso 4 de esta guía             | abc~xyz123...                        |
-| EMAIL_SENDER         | Cuenta real de tu M365          | nominas@agdlegal.com                 |
+| EMAIL_SENDER         | Cuenta real de tu M365          | nominas@empresa.com                 |
