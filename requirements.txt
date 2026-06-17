@@ -9,14 +9,23 @@ streamlit>=1.28.0
 
 # Procesamiento de datos
 pandas>=1.5.0
-openpyxl>=3.1.0       # Motor de lectura/escritura de archivos .xlsx
+openpyxl>=3.1.0         # Motor de lectura/escritura de archivos .xlsx
 
 # Procesamiento de archivos
-PyPDF2>=2.12.0        # Extracción de texto de PDFs
-lxml>=4.9.0           # Parser XML de alto rendimiento
+pypdf>=4.0.0            # Sucesor oficial de PyPDF2 (mismo API, mantenido activamente)
+lxml>=4.9.0             # Parser XML de alto rendimiento
+
+# Autenticación Microsoft 365 (Graph API)
+msal>=1.26.0            # Microsoft Authentication Library
+
+# HTTP para Graph API
+requests>=2.31.0
 
 # Configuración y seguridad
-python-dotenv>=1.0.0  # Carga de variables de entorno desde .env
+python-dotenv>=1.0.0    # Carga de variables de entorno desde .env
+
+# Base de datos
+# sqlite3 ya viene incluido en Python estándar — no requiere instalación
 
 # Testing
 pytest>=7.4.0

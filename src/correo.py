@@ -1,25 +1,40 @@
 """
-correo.py — Módulo de envío de correos electrónicos.
+correo.py — Módulo de envío de correos vía Microsoft Graph API.
 
-Responsabilidad única: construir y enviar el mensaje SMTP.
-Esta capa NO maneja errores de negocio: si algo falla, lanza
-la excepción para que el caller decida cómo registrarla y
-qué hacer con el flujo.
+Reemplaza la implementación SMTP anterior por Graph API con autenticación
+OAuth2 (Client Credentials Flow). Esto es más robusto que SMTP porque:
+  - No depende de contraseñas de aplicación que expiran o se revocan.
+  - No se rompe cuando el administrador cambia políticas SMTP de M365.
+  - Usa el estándar moderno recomendado por Microsoft.
+  - Los correos salen desde el buzón real del remitente, no de un relay.
+
+Responsabilidad única: construir y enviar el mensaje.
+Si algo falla, lanza la excepción para que el caller decida qué hacer.
 """
 
-import os
-import smtplib
-from email import encoders
-from email.mime.base import MIMEBase
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import base64
+import json
 from pathlib import Path
 
-from config import EMAIL_SENDER, EMAIL_PASSWORD, SMTP_SERVER, SMTP_PORT
+import msal
+import requests
 
-# Límite conservador por debajo del máximo de Gmail (25 MB)
-# para dejar margen a los headers del mensaje.
+from config import AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, EMAIL_SENDER
+
+# Límite conservador por debajo del máximo de Graph API (150 MB)
 MAX_ADJUNTO_BYTES = 20 * 1024 * 1024  # 20 MB
+
+# Scope requerido para enviar correo como usuario específico
+_GRAPH_SCOPES = ["https://graph.microsoft.com/.default"]
+_GRAPH_SEND_URL = f"https://graph.microsoft.com/v1.0/users/{EMAIL_SENDER}/sendMail"
+
+
+class GraphAuthError(Exception):
+    """Credenciales de Azure AD inválidas o permisos insuficientes."""
+
+
+class GraphSendError(Exception):
+    """Error al enviar el correo a través de Graph API."""
 
 
 def enviar_correo(
@@ -29,7 +44,8 @@ def enviar_correo(
     archivos_adjuntos: list[str],
 ) -> None:
     """
-    Construye y envía un correo con los archivos adjuntos indicados.
+    Construye y envía un correo con los archivos adjuntos indicados,
+    usando Microsoft Graph API con autenticación OAuth2.
 
     Args:
         destinatario:      Dirección de correo del receptor.
@@ -40,30 +56,150 @@ def enviar_correo(
     Raises:
         FileNotFoundError:  Si algún archivo adjunto no existe.
         ValueError:         Si algún adjunto supera el límite de tamaño.
-        smtplib.SMTPException: Si ocurre cualquier error durante el envío SMTP.
-
-    Note:
-        Esta función NO captura excepciones. El caller es responsable
-        de manejarlas y registrarlas según su contexto (UI, CLI, etc.).
+        GraphAuthError:     Si las credenciales de Azure AD son inválidas.
+        GraphSendError:     Si Graph API rechaza el envío por cualquier otra razón.
     """
     _validar_adjuntos(archivos_adjuntos)
-
-    msg = _construir_mensaje(destinatario, asunto, cuerpo, archivos_adjuntos)
-
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-        server.starttls()
-        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        server.send_message(msg)
+    token = _obtener_token()
+    payload = _construir_payload(destinatario, asunto, cuerpo, archivos_adjuntos)
+    _enviar_via_graph(token, payload)
 
 
 # ------------------------------------------------------------------
-# Helpers privados
+# Autenticación
+# ------------------------------------------------------------------
+
+def _obtener_token() -> str:
+    """
+    Obtiene un access token de Azure AD usando Client Credentials Flow.
+    MSAL cachea el token automáticamente hasta que expira (normalmente 1 hora).
+    """
+    app = msal.ConfidentialClientApplication(
+        client_id=AZURE_CLIENT_ID,
+        client_credential=AZURE_CLIENT_SECRET,
+        authority=f"https://login.microsoftonline.com/{AZURE_TENANT_ID}",
+    )
+
+    resultado = app.acquire_token_for_client(scopes=_GRAPH_SCOPES)
+
+    if "access_token" not in resultado:
+        error = resultado.get("error", "unknown_error")
+        descripcion = resultado.get("error_description", "Sin descripción")
+        raise GraphAuthError(
+            f"No se pudo obtener token de Azure AD.\n"
+            f"Error: {error}\n"
+            f"Descripción: {descripcion}\n\n"
+            f"Verifica AZURE_TENANT_ID, AZURE_CLIENT_ID y AZURE_CLIENT_SECRET en .env"
+        )
+
+    return resultado["access_token"]
+
+
+# ------------------------------------------------------------------
+# Construcción del payload
+# ------------------------------------------------------------------
+
+def _construir_payload(
+    destinatario: str,
+    asunto: str,
+    cuerpo: str,
+    archivos_adjuntos: list[str],
+) -> dict:
+    """
+    Construye el payload JSON para Graph API /sendMail.
+    Separado del envío para facilitar testing sin red.
+    """
+    adjuntos_json = [
+        _archivo_a_adjunto(ruta) for ruta in archivos_adjuntos
+    ]
+
+    return {
+        "message": {
+            "subject": asunto,
+            "body": {
+                "contentType": "Text",
+                "content": cuerpo,
+            },
+            "toRecipients": [
+                {"emailAddress": {"address": destinatario}}
+            ],
+            "attachments": adjuntos_json,
+        },
+        "saveToSentItems": True,  # El correo queda en la bandeja de enviados
+    }
+
+
+def _archivo_a_adjunto(ruta: str) -> dict:
+    """Convierte una ruta de archivo al formato de adjunto de Graph API."""
+    path = Path(ruta)
+    contenido_b64 = base64.b64encode(path.read_bytes()).decode("utf-8")
+
+    return {
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "name": path.name,
+        "contentType": _inferir_content_type(path),
+        "contentBytes": contenido_b64,
+    }
+
+
+def _inferir_content_type(path: Path) -> str:
+    tipos = {
+        ".pdf": "application/pdf",
+        ".xml": "application/xml",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }
+    return tipos.get(path.suffix.lower(), "application/octet-stream")
+
+
+# ------------------------------------------------------------------
+# Envío
+# ------------------------------------------------------------------
+
+def _enviar_via_graph(token: str, payload: dict) -> None:
+    """
+    Realiza el POST a Graph API. Lanza excepción con mensaje claro
+    si la respuesta no es 202 Accepted.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    respuesta = requests.post(
+        _GRAPH_SEND_URL,
+        headers=headers,
+        data=json.dumps(payload),
+        timeout=30,
+    )
+
+    # Graph API retorna 202 Accepted para envío exitoso
+    if respuesta.status_code == 202:
+        return
+
+    # Errores de autenticación — señal para abortar el procesamiento completo
+    if respuesta.status_code in (401, 403):
+        raise GraphAuthError(
+            f"Error de autenticación con Graph API (HTTP {respuesta.status_code}).\n"
+            f"Verifica que la app en Azure AD tenga el permiso 'Mail.Send'.\n"
+            f"Detalle: {respuesta.text}"
+        )
+
+    # Cualquier otro error HTTP
+    raise GraphSendError(
+        f"Graph API rechazó el envío (HTTP {respuesta.status_code}).\n"
+        f"Destinatario: {payload['message']['toRecipients'][0]['emailAddress']['address']}\n"
+        f"Detalle: {respuesta.text}"
+    )
+
+
+# ------------------------------------------------------------------
+# Validación de adjuntos (igual que antes, independiente del proveedor)
 # ------------------------------------------------------------------
 
 def _validar_adjuntos(archivos: list[str]) -> None:
     """
-    Verifica existencia y tamaño de cada adjunto antes de abrir
-    la conexión SMTP, fallando rápido con mensajes claros.
+    Verifica existencia y tamaño de cada adjunto antes de conectarse,
+    fallando rápido con mensajes claros.
     """
     for ruta in archivos:
         path = Path(ruta)
@@ -80,36 +216,3 @@ def _validar_adjuntos(archivos: list[str]) -> None:
                 f"supera el límite permitido de "
                 f"{MAX_ADJUNTO_BYTES / 1024 / 1024:.0f} MB."
             )
-
-
-def _construir_mensaje(
-    destinatario: str,
-    asunto: str,
-    cuerpo: str,
-    archivos_adjuntos: list[str],
-) -> MIMEMultipart:
-    """
-    Construye el objeto MIMEMultipart con cuerpo y adjuntos.
-    Separado de la lógica SMTP para facilitar testing sin red.
-    """
-    msg = MIMEMultipart()
-    msg["From"] = EMAIL_SENDER
-    msg["To"] = destinatario
-    msg["Subject"] = asunto
-    msg.attach(MIMEText(cuerpo, "plain"))
-
-    for ruta in archivos_adjuntos:
-        nombre_archivo = Path(ruta).name
-        part = MIMEBase("application", "octet-stream")
-
-        with open(ruta, "rb") as f:
-            part.set_payload(f.read())
-
-        encoders.encode_base64(part)
-        part.add_header(
-            "Content-Disposition",
-            f'attachment; filename="{nombre_archivo}"',
-        )
-        msg.attach(part)
-
-    return msg

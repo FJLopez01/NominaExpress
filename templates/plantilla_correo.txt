@@ -1,0 +1,11 @@
+Estimado(a) {nombre},
+
+Por medio del presente reciba un cordial saludo y al mismo tiempo
+enviamos en archivo adjunto el CFDI con el formato electrónico XML(s)
+de las remuneraciones cubiertas en el período indicado en el título
+del correo.
+
+Periodo: {fecha_inicial} al {fecha_final}
+Total a pagar: {total}
+
+Saludos cordiales.

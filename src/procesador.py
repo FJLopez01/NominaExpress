@@ -2,37 +2,50 @@
 procesador.py — Lógica de procesamiento de nóminas.
 
 Responsabilidades:
-- Leer y parsear el Excel de correos.
-- Extraer datos de archivos XML (CFDI).
-- Construir índice de PDFs por CURP (O(n) lectura única al inicio).
-- Renombrar PDFs de forma segura (sin pérdida de datos ante crashes).
-- Orquestar el procesamiento completo (sin dependencias de UI).
+  - Leer y parsear el Excel de correos (columnas case-insensitive).
+  - Extraer datos completos de archivos XML (CFDI 4.0).
+  - Construir índice de PDFs por CURP O(n).
+  - Verificar idempotencia por UUID antes de cada envío.
+  - Renombrar PDFs de forma segura.
+  - Registrar cada envío exitoso en SQLite.
+  - Orquestar el procesamiento completo sin dependencias de UI.
+
+Cambios respecto a la versión anterior:
+  - PyPDF2 → pypdf (sucesor oficial mantenido activamente).
+  - Excepciones específicas en extraer_datos_xml (no captura Exception genérica).
+  - Columnas del Excel normalizadas a Title Case (acepta "nombre", "NOMBRE", etc.).
+  - Cuerpo del correo leído desde plantilla externa (templates/plantilla_correo.txt).
+  - Idempotencia por UUID: si un recibo ya fue enviado, se salta sin error.
+  - Datos completos del XML extraídos para registro en BD y cuerpo del correo.
 """
 
 import os
 import re
 import shutil
-import smtplib
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 from typing import Callable
 
 import pandas as pd
-from PyPDF2 import PdfReader
+from pypdf import PdfReader  # ← pypdf, no PyPDF2
 
-from config import XML_PATH, PDF_PATH, EXCEL_CORREOS
-from correo import enviar_correo
+from config import XML_PATH, PDF_PATH, EXCEL_CORREOS, leer_plantilla_correo
+from correo import enviar_correo, GraphAuthError, GraphSendError
+from database import ya_fue_enviado, registrar_envio
 from logger import obtener_logger
 from utilidades import limpiar_nombre, normalizar_nombre_para_busqueda
 
 log = obtener_logger(__name__)
 
-# Patrón RFC 5322 simplificado — cubre el 99.9% de correos reales
+# RFC 5322 simplificado
 _EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
 
-COLUMNAS_REQUERIDAS = {"Nombre", "Correo"}
+# Columnas requeridas en el Excel (se validan después de normalizar a Title Case)
+COLUMNA_NOMBRE = "Nombre"
+COLUMNA_CORREO = "Correo"
+COLUMNAS_REQUERIDAS = {COLUMNA_NOMBRE, COLUMNA_CORREO}
 
 
 # ------------------------------------------------------------------
@@ -40,42 +53,59 @@ COLUMNAS_REQUERIDAS = {"Nombre", "Correo"}
 # ------------------------------------------------------------------
 
 class EstadoNomina(Enum):
-    EXITOSO          = auto()
-    ERROR_XML        = auto()
-    PDF_NO_ENCONTRADO = auto()
-    ERROR_RENAME     = auto()
-    CORREO_NO_ENCONTRADO = auto()
-    ERROR_SMTP_AUTH  = auto()  # Señal especial: abortar todo el procesamiento
-    ERROR_SMTP       = auto()
-    ERROR_ARCHIVO    = auto()
-    ERROR_VALIDACION = auto()
+    EXITOSO               = auto()
+    YA_ENVIADO            = auto()   # Nuevo: UUID ya registrado en BD
+    ERROR_XML             = auto()
+    PDF_NO_ENCONTRADO     = auto()
+    ERROR_RENAME          = auto()
+    CORREO_NO_ENCONTRADO  = auto()
+    ERROR_AUTH_GRAPH      = auto()   # Reemplaza ERROR_SMTP_AUTH
+    ERROR_ENVIO           = auto()   # Reemplaza ERROR_SMTP
+    ERROR_ARCHIVO         = auto()
+    ERROR_VALIDACION      = auto()
 
 
 @dataclass
 class ResultadoNomina:
     """
     Resultado del procesamiento de un único XML/empleado.
-    Desacopla completamente la lógica de negocio de la capa de UI:
-    app.py y main.py reciben esta estructura y deciden cómo mostrarla.
+    Desacopla completamente la lógica de negocio de la capa de UI.
     """
     xml_file: str
     estado: EstadoNomina
     mensaje: str
     nombre: str = ""
     correo: str = ""
+    uuid: str = ""
 
     @property
     def exitoso(self) -> bool:
-        return self.estado == EstadoNomina.EXITOSO
+        return self.estado in (EstadoNomina.EXITOSO, EstadoNomina.YA_ENVIADO)
 
     @property
     def es_error_fatal(self) -> bool:
         """Si True, el procesamiento completo debe detenerse."""
-        return self.estado == EstadoNomina.ERROR_SMTP_AUTH
+        return self.estado == EstadoNomina.ERROR_AUTH_GRAPH
 
 
-# Tipo del callback de progreso: recibe (procesados, total, resultado_actual)
-CallbackProgreso = Callable[[int, int, ResultadoNomina], None]
+CallbackProgreso = Callable[[int, int, "ResultadoNomina"], None]
+
+
+# ------------------------------------------------------------------
+# Datos completos del XML
+# ------------------------------------------------------------------
+
+@dataclass
+class DatosXML:
+    """Todos los campos relevantes extraídos de un CFDI de nómina."""
+    nombre: str
+    curp: str
+    uuid: str
+    num_empleado: str
+    rfc_receptor: str
+    periodo_inicio: str
+    periodo_fin: str
+    total: str
 
 
 # ------------------------------------------------------------------
@@ -90,44 +120,37 @@ def ejecutar_procesamiento(
     """
     Procesa todos los XMLs del directorio configurado.
 
-    Recibe los datos ya cargados (correos e índice de PDFs) para
-    evitar releer disco en cada llamada y permitir testing sin I/O.
-
     Args:
         correos_por_nombre: {nombre_normalizado: correo} del Excel.
         indice_pdfs:        {curp: Path_al_pdf} construido por construir_indice_pdfs().
         on_progreso:        Callback opcional llamado después de cada XML.
-                            Útil para actualizar barras de progreso en UI.
 
     Returns:
         Lista de ResultadoNomina, uno por XML encontrado.
-        El caller decide cómo presentar o loggear cada resultado.
 
     Note:
-        Si se encuentra un ERROR_SMTP_AUTH, el procesamiento se detiene
+        Si se encuentra un ERROR_AUTH_GRAPH, el procesamiento se detiene
         inmediatamente — no tiene sentido reintentar con credenciales inválidas.
     """
-    xml_files = [f for f in os.listdir(XML_PATH) if f.endswith(".xml")]
+    xml_files = sorted(f for f in os.listdir(XML_PATH) if f.endswith(".xml"))
     total = len(xml_files)
     resultados: list[ResultadoNomina] = []
+    plantilla = leer_plantilla_correo()
 
     for i, xml_file in enumerate(xml_files):
-        resultado = _procesar_xml(xml_file, correos_por_nombre, indice_pdfs)
+        resultado = _procesar_xml(xml_file, correos_por_nombre, indice_pdfs, plantilla)
         resultados.append(resultado)
 
-        # Persistir en archivo — sobrevive recargas de Streamlit
-        if resultado.exitoso:
-            log.info("[%d/%d] %s", i + 1, total, resultado.mensaje)
-        elif resultado.es_error_fatal:
-            log.critical("[%d/%d] %s", i + 1, total, resultado.mensaje)
-        else:
-            log.warning("[%d/%d] %s", i + 1, total, resultado.mensaje)
+        nivel_log = "info" if resultado.exitoso else (
+            "critical" if resultado.es_error_fatal else "warning"
+        )
+        getattr(log, nivel_log)("[%d/%d] %s", i + 1, total, resultado.mensaje)
 
         if on_progreso:
             on_progreso(i + 1, total, resultado)
 
         if resultado.es_error_fatal:
-            log.critical("Procesamiento abortado por error de autenticación.")
+            log.critical("Procesamiento abortado: credenciales de Azure AD inválidas.")
             break
 
     return resultados
@@ -137,113 +160,158 @@ def _procesar_xml(
     xml_file: str,
     correos_por_nombre: dict[str, str],
     indice_pdfs: dict[str, Path],
+    plantilla: str,
 ) -> ResultadoNomina:
-    """Procesa un único XML y retorna su resultado. Sin efectos de UI."""
+    """Procesa un único XML. Sin efectos de UI."""
     xml_path = str(XML_PATH / xml_file)
 
-    # Extraer datos del XML
-    nombre, curp = extraer_datos_xml(xml_path)
-    if not nombre or not curp:
+    # 1. Extraer datos del XML
+    datos = extraer_datos_xml(xml_path)
+    if datos is None:
         return ResultadoNomina(
             xml_file=xml_file,
             estado=EstadoNomina.ERROR_XML,
             mensaje=f"No se pudieron extraer datos de {xml_file}",
         )
 
-    # Buscar PDF en el índice
-    pdf_path = indice_pdfs.get(curp)
+    # 2. Idempotencia: saltar si este UUID ya fue enviado
+    if ya_fue_enviado(datos.uuid):
+        return ResultadoNomina(
+            xml_file=xml_file,
+            estado=EstadoNomina.YA_ENVIADO,
+            mensaje=f"Ya enviado anteriormente: {datos.nombre} (UUID: {datos.uuid[:8]}...)",
+            nombre=datos.nombre,
+            uuid=datos.uuid,
+        )
+
+    # 3. Buscar PDF por CURP
+    pdf_path = indice_pdfs.get(datos.curp)
     if not pdf_path:
         return ResultadoNomina(
             xml_file=xml_file,
             estado=EstadoNomina.PDF_NO_ENCONTRADO,
-            mensaje=f"PDF no encontrado para {nombre} (CURP: {curp})",
-            nombre=nombre,
+            mensaje=f"PDF no encontrado para {datos.nombre} (CURP: {datos.curp})",
+            nombre=datos.nombre,
+            uuid=datos.uuid,
         )
 
-    # Renombrar PDF
-    nombre_limpio = limpiar_nombre(nombre)
+    # 4. Renombrar PDF
+    nombre_limpio = limpiar_nombre(datos.nombre)
     try:
-        nuevo_path = renombrar_pdf_seguro(str(pdf_path), nombre_limpio, curp)
+        nuevo_pdf_path = renombrar_pdf_seguro(str(pdf_path), nombre_limpio, datos.curp)
     except (FileNotFoundError, RuntimeError) as e:
         return ResultadoNomina(
             xml_file=xml_file,
             estado=EstadoNomina.ERROR_RENAME,
-            mensaje=f"Error al renombrar PDF para {nombre}: {e}",
-            nombre=nombre,
+            mensaje=f"Error al renombrar PDF para {datos.nombre}: {e}",
+            nombre=datos.nombre,
+            uuid=datos.uuid,
         )
 
-    # Buscar correo
-    clave = normalizar_nombre_para_busqueda(nombre)
+    # 5. Buscar correo
+    clave = normalizar_nombre_para_busqueda(datos.nombre)
     correo = correos_por_nombre.get(clave)
     if not correo:
         return ResultadoNomina(
             xml_file=xml_file,
             estado=EstadoNomina.CORREO_NO_ENCONTRADO,
-            mensaje=f"Correo no encontrado para: {nombre}",
-            nombre=nombre,
+            mensaje=f"Correo no encontrado para: {datos.nombre}",
+            nombre=datos.nombre,
+            uuid=datos.uuid,
         )
 
-    # Enviar correo
-    asunto = f"Recibo de Nómina - {nombre}"
-    cuerpo = (
-        f"Estimado(a) {nombre},\n\n"
-        "Por medio del presente reciba un cordial saludo y al mismo tiempo "
-        "enviamos en archivo adjunto el CFDI con el formato electrónico XML(s) "
-        "de las remuneraciones cubiertas en el período indicado en el título "
-        "del correo.\n\n"
-        "Saludos cordiales."
+    # 6. Construir cuerpo del correo desde plantilla
+    asunto = f"Recibo de Nómina — {datos.nombre} ({datos.periodo_inicio} al {datos.periodo_fin})"
+    cuerpo = plantilla.format(
+        nombre=datos.nombre,
+        fecha_inicial=datos.periodo_inicio,
+        fecha_final=datos.periodo_fin,
+        total=datos.total,
     )
 
+    # 7. Enviar correo
     try:
-        enviar_correo(correo, asunto, cuerpo, [xml_path, str(nuevo_path)])
+        enviar_correo(correo, asunto, cuerpo, [xml_path, str(nuevo_pdf_path)])
+
+    except GraphAuthError as e:
         return ResultadoNomina(
             xml_file=xml_file,
-            estado=EstadoNomina.EXITOSO,
-            mensaje=f"Correo enviado a {nombre} ({correo})",
-            nombre=nombre,
-            correo=correo,
+            estado=EstadoNomina.ERROR_AUTH_GRAPH,
+            mensaje=f"Error de autenticación con Azure AD: {e}",
+            nombre=datos.nombre,
+            uuid=datos.uuid,
         )
 
-    except smtplib.SMTPAuthenticationError:
+    except GraphSendError as e:
         return ResultadoNomina(
             xml_file=xml_file,
-            estado=EstadoNomina.ERROR_SMTP_AUTH,
-            mensaje="Credenciales de Gmail inválidas. Verifica EMAIL_SENDER y EMAIL_PASSWORD en .env",
-            nombre=nombre,
-        )
-
-    except smtplib.SMTPException as e:
-        return ResultadoNomina(
-            xml_file=xml_file,
-            estado=EstadoNomina.ERROR_SMTP,
-            mensaje=f"Error SMTP para {nombre}: {e}",
-            nombre=nombre,
+            estado=EstadoNomina.ERROR_ENVIO,
+            mensaje=f"Error al enviar correo para {datos.nombre}: {e}",
+            nombre=datos.nombre,
+            uuid=datos.uuid,
         )
 
     except FileNotFoundError as e:
         return ResultadoNomina(
             xml_file=xml_file,
             estado=EstadoNomina.ERROR_ARCHIVO,
-            mensaje=f"Archivo no encontrado para {nombre}: {e}",
-            nombre=nombre,
+            mensaje=f"Archivo no encontrado para {datos.nombre}: {e}",
+            nombre=datos.nombre,
+            uuid=datos.uuid,
         )
 
     except ValueError as e:
         return ResultadoNomina(
             xml_file=xml_file,
             estado=EstadoNomina.ERROR_VALIDACION,
-            mensaje=f"Error de validación para {nombre}: {e}",
-            nombre=nombre,
+            mensaje=f"Error de validación para {datos.nombre}: {e}",
+            nombre=datos.nombre,
+            uuid=datos.uuid,
         )
+
+    # 8. Registrar envío exitoso en SQLite
+    registrar_envio(
+        uuid=datos.uuid,
+        num_empleado=datos.num_empleado,
+        rfc_receptor=datos.rfc_receptor,
+        curp=datos.curp,
+        nombre=datos.nombre,
+        periodo_inicio=datos.periodo_inicio,
+        periodo_fin=datos.periodo_fin,
+        total=datos.total,
+        correo=correo,
+        xml_file=xml_file,
+        pdf_file=nuevo_pdf_path.name,
+    )
+
+    return ResultadoNomina(
+        xml_file=xml_file,
+        estado=EstadoNomina.EXITOSO,
+        mensaje=f"Correo enviado a {datos.nombre} ({correo})",
+        nombre=datos.nombre,
+        correo=correo,
+        uuid=datos.uuid,
+    )
 
 
 # ------------------------------------------------------------------
-# Excel de correos
+# Excel de correos — columnas case-insensitive
 # ------------------------------------------------------------------
 
 def leer_correos_excel() -> dict[str, str]:
+    """
+    Lee el Excel de correos y retorna {nombre_normalizado: correo}.
+
+    Acepta columnas con cualquier capitalización:
+      "nombre", "NOMBRE", "Nombre" → todos son válidos.
+    Los correos con formato inválido se excluyen con warning.
+    """
     df = pd.read_excel(EXCEL_CORREOS)
-    df.columns = df.columns.str.strip()
+
+    # Normalizar nombres de columna: strip + Title Case
+    # Esto acepta "nombre", "NOMBRE", "Correo Electrónico" si el cliente
+    # tiene el Excel con formato distinto. Ajusta COLUMNAS_REQUERIDAS si cambia.
+    df.columns = df.columns.str.strip().str.title()
 
     faltantes = COLUMNAS_REQUERIDAS - set(df.columns)
     if faltantes:
@@ -253,96 +321,125 @@ def leer_correos_excel() -> dict[str, str]:
             f"Columnas encontradas: {set(df.columns)}"
         )
 
-    df["Nombre"] = df["Nombre"].astype(str)
-    df["Nombre_normalizado"] = df["Nombre"].apply(normalizar_nombre_para_busqueda)
+    df[COLUMNA_NOMBRE] = df[COLUMNA_NOMBRE].astype(str)
+    df["_clave"] = df[COLUMNA_NOMBRE].apply(normalizar_nombre_para_busqueda)
 
-    # Validar formato de cada correo antes de construir el diccionario.
-    # Los inválidos se excluyen con un warning — no detienen la carga completa.
-    invalidos = []
+    # Validar correos
     validos_mask = []
+    invalidos = []
 
     for _, fila in df.iterrows():
-        correo = str(fila["Correo"]).strip() if pd.notna(fila["Correo"]) else ""
+        correo = str(fila[COLUMNA_CORREO]).strip() if pd.notna(fila[COLUMNA_CORREO]) else ""
         if _es_correo_valido(correo):
             validos_mask.append(True)
         else:
-            invalidos.append((fila["Nombre"], correo))
+            invalidos.append((fila[COLUMNA_NOMBRE], correo))
             validos_mask.append(False)
 
     if invalidos:
         for nombre, correo in invalidos:
             log.warning(
-                "Correo inválido o vacío para '%s': '%s' — se excluye del procesamiento.",
+                "Correo inválido o vacío para '%s': '%s' — excluido del procesamiento.",
                 nombre, correo,
             )
         log.warning(
-            "%d registro(s) excluidos por correo inválido. "
-            "Revisa el archivo: %s",
+            "%d registro(s) excluidos por correo inválido. Revisa: %s",
             len(invalidos), EXCEL_CORREOS,
         )
 
     df_valido = df[validos_mask]
-    log.info("Base de correos cargada: %d válidos, %d excluidos.", len(df_valido), len(invalidos))
+    log.info(
+        "Base de correos cargada: %d válidos, %d excluidos.",
+        len(df_valido), len(invalidos),
+    )
 
-    return dict(zip(df_valido["Nombre_normalizado"], df_valido["Correo"].str.strip()))
+    return dict(zip(df_valido["_clave"], df_valido[COLUMNA_CORREO].str.strip()))
 
 
 def _es_correo_valido(correo: str) -> bool:
-    """Valida formato básico de dirección de correo electrónico."""
     return bool(correo and _EMAIL_REGEX.match(correo))
 
 
 # ------------------------------------------------------------------
-# XML
+# XML — extracción completa de datos
 # ------------------------------------------------------------------
 
-def extraer_datos_xml(xml_file: str) -> tuple[str | None, str | None]:
-    namespaces = {
-        "cfdi": "http://www.sat.gob.mx/cfd/4",
-        "nomina12": "http://www.sat.gob.mx/nomina12",
-    }
+_NS = {
+    "cfdi":     "http://www.sat.gob.mx/cfd/4",
+    "nomina12": "http://www.sat.gob.mx/nomina12",
+    "tfd":      "http://www.sat.gob.mx/TimbreFiscalDigital",
+}
+
+
+def extraer_datos_xml(xml_file: str) -> DatosXML | None:
+    """
+    Extrae todos los campos relevantes de un CFDI de nómina.
+
+    Retorna None si el XML está malformado o le falta estructura esperada.
+    Nunca propaga excepciones — el caller recibe None como señal de error.
+
+    Campos extraídos:
+      - Nombre, CURP del receptor
+      - UUID del TimbreFiscalDigital
+      - NumEmpleado, RFC del receptor
+      - FechaInicialPago, FechaFinalPago
+      - Total del comprobante
+    """
     try:
         tree = ET.parse(xml_file)
         root = tree.getroot()
-        nombre = root.find(".//cfdi:Receptor", namespaces).attrib.get("Nombre")
-        curp = root.find(".//nomina12:Receptor", namespaces).attrib.get("Curp").upper()
-        return nombre, curp
-    except Exception as e:
-        log.error("Error al parsear XML '%s': %s", xml_file, e)
-        return None, None
+
+        receptor_cfdi    = root.find(".//cfdi:Receptor", _NS)
+        receptor_nomina  = root.find(".//nomina12:Receptor", _NS)
+        nomina           = root.find(".//nomina12:Nomina", _NS)
+        tfd              = root.find(".//tfd:TimbreFiscalDigital", _NS)
+
+        # Validar que todos los nodos requeridos existan antes de leer atributos
+        if any(nodo is None for nodo in [receptor_cfdi, receptor_nomina, nomina, tfd]):
+            log.error(
+                "XML '%s' incompleto: falta uno o más nodos requeridos "
+                "(cfdi:Receptor, nomina12:Receptor, nomina12:Nomina, tfd:TimbreFiscalDigital).",
+                xml_file,
+            )
+            return None
+
+        return DatosXML(
+            nombre         = receptor_cfdi.attrib["Nombre"],
+            curp           = receptor_nomina.attrib["Curp"].upper(),
+            uuid           = tfd.attrib["UUID"],
+            num_empleado   = receptor_nomina.attrib.get("NumEmpleado", ""),
+            rfc_receptor   = receptor_cfdi.attrib.get("Rfc", ""),
+            periodo_inicio = nomina.attrib.get("FechaInicialPago", ""),
+            periodo_fin    = nomina.attrib.get("FechaFinalPago", ""),
+            total          = root.attrib.get("Total", ""),
+        )
+
+    except ET.ParseError as e:
+        log.error("XML malformado '%s': %s", xml_file, e)
+        return None
+
+    except KeyError as e:
+        log.error("Atributo faltante en XML '%s': %s", xml_file, e)
+        return None
+
+    except FileNotFoundError:
+        log.error("Archivo XML no encontrado: '%s'", xml_file)
+        return None
 
 
 # ------------------------------------------------------------------
-# PDF — índice
+# PDF — índice O(n)
 # ------------------------------------------------------------------
 
 def construir_indice_pdfs() -> dict[str, Path]:
     """
-    Lee cada PDF del directorio UNA SOLA VEZ y construye un índice
-    {curp: ruta_pdf}. Debe llamarse una vez al inicio del procesamiento
-    y reutilizarse para todas las búsquedas.
-
-    Complejidad: O(n) — cada PDF se lee exactamente una vez,
-    independientemente de cuántos XMLs haya que procesar.
-    Antes (buscar_pdf_por_curp): O(n²) — cada XML relanzaba
-    una lectura completa de todos los PDFs.
-
-    Returns:
-        Diccionario {curp_en_mayusculas: Path_al_pdf}.
-        PDFs que no contienen CURP válido o son ilegibles se omiten
-        con un warning, sin detener el procesamiento.
-
-    Note:
-        Asume un PDF por empleado. Si un PDF contiene múltiples CURPs,
-        todos quedan indexados apuntando al mismo archivo.
+    Lee cada PDF del directorio UNA SOLA VEZ y construye {curp: ruta_pdf}.
+    Complejidad O(n) — reutilizar para todas las búsquedas.
     """
-    # Patrón oficial CURP del SAT:
-    # 4 letras + 6 dígitos fecha + H/M + 2 letras estado +
-    # 3 letras apellidos/nombre + 1 alfanumérico + 1 dígito verificador
     patron_curp = re.compile(r"[A-Z]{4}\d{6}[HM][A-Z]{2}[A-Z]{3}[A-Z0-9]\d")
 
     indice: dict[str, Path] = {}
-    archivos_no_procesados: list[str] = []
+    sin_curp: list[str] = []
 
     for pdf_file in Path(PDF_PATH).iterdir():
         if pdf_file.suffix.lower() != ".pdf":
@@ -350,13 +447,14 @@ def construir_indice_pdfs() -> dict[str, Path]:
 
         try:
             contenido = _extraer_texto_pdf(pdf_file)
-            curps_encontrados = patron_curp.findall(contenido)
+            curps = patron_curp.findall(contenido)
 
-            if not curps_encontrados:
-                archivos_no_procesados.append(pdf_file.name)
+            if not curps:
+                sin_curp.append(pdf_file.name)
+                log.warning("PDF '%s' no contiene CURP válido — omitido.", pdf_file.name)
                 continue
 
-            for curp in curps_encontrados:
+            for curp in curps:
                 if curp in indice:
                     log.warning(
                         "CURP duplicado '%s' en '%s' (ya indexado desde '%s') — se conserva el primero.",
@@ -366,25 +464,17 @@ def construir_indice_pdfs() -> dict[str, Path]:
                     indice[curp] = pdf_file
 
         except Exception as e:
-            log.error("PDF inválido '%s': %s", pdf_file.name, e)
+            log.error("Error al procesar PDF '%s': %s", pdf_file.name, e)
 
-    if archivos_no_procesados:
-        log.warning(
-            "%d PDF(s) sin CURP reconocible (portadas u otros documentos): %s",
-            len(archivos_no_procesados),
-            ", ".join(archivos_no_procesados),
-        )
-
-    log.info("Índice de PDFs construido: %d CURPs indexados.", len(indice))
+    log.info(
+        "Índice de PDFs construido: %d CURPs indexados, %d sin CURP.",
+        len(indice), len(sin_curp),
+    )
     return indice
 
 
 def _extraer_texto_pdf(ruta: Path) -> str:
-    """
-    Extrae todo el texto de un PDF.
-    Separada de construir_indice_pdfs para facilitar testing y
-    para poder extenderse con OCR en el futuro si se necesita.
-    """
+    """Extrae todo el texto de un PDF usando pypdf."""
     contenido = []
     with open(ruta, "rb") as f:
         reader = PdfReader(f)
@@ -396,67 +486,43 @@ def _extraer_texto_pdf(ruta: Path) -> str:
 
 
 # ------------------------------------------------------------------
-# PDF — renombrado seguro
+# PDF — renombrado seguro (sin cambios de lógica)
 # ------------------------------------------------------------------
 
 def renombrar_pdf_seguro(origen: str, nombre_limpio: str, curp: str) -> Path:
     """
-    Renombra un PDF usando copy+delete en lugar de rename.
-
-    Estrategia:
-        1. Calcular la ruta destino.
-        2. Si ya existe, retornarla sin hacer nada (idempotente).
-        3. Copiar el original al destino (shutil.copy2 preserva metadatos).
-        4. Verificar que la copia existe y no está vacía.
-        5. Solo entonces borrar el original.
-
-    De esta forma, ante cualquier crash entre los pasos 3 y 5,
-    el archivo original sigue intacto y la operación es segura
-    de reintentar.
-
-    Args:
-        origen:        Ruta absoluta al PDF original.
-        nombre_limpio: Nombre del empleado ya normalizado (sin tildes, sin espacios).
-        curp:          CURP del empleado en mayúsculas.
-
-    Returns:
-        Path al archivo en su ubicación final (renombrado o ya existente).
+    Renombra un PDF usando copy+delete.
+    Idempotente: si el destino ya existe, retorna sin hacer nada.
 
     Raises:
-        RuntimeError: Si la copia falla o el archivo destino queda corrupto.
+        FileNotFoundError: Si el origen desapareció entre la indexación y este punto.
+        RuntimeError:      Si la copia falla o el archivo destino queda corrupto.
     """
-    origen_path = Path(origen)
+    origen_path  = Path(origen)
     destino_path = Path(PDF_PATH) / f"{nombre_limpio}-{curp}.pdf"
 
-    # Caso 1: ya fue renombrado en una ejecución anterior → idempotente
     if destino_path.exists():
         return destino_path
 
-    # Caso 2: el origen desapareció entre buscar_pdf_por_curp y este punto
     if not origen_path.exists():
         raise FileNotFoundError(
-            f"El PDF original ya no existe en la ruta esperada: {origen_path}\n"
-            f"Es posible que haya sido movido o renombrado por otra ejecución."
+            f"El PDF original ya no existe: {origen_path}\n"
+            f"Puede haber sido movido por otra ejecución."
         )
 
     try:
-        # Paso 3: copiar preservando metadatos (fecha modificación, etc.)
         shutil.copy2(str(origen_path), str(destino_path))
 
-        # Paso 4: verificar integridad mínima antes de borrar el original
         if not destino_path.exists() or destino_path.stat().st_size == 0:
             raise RuntimeError(
                 f"La copia de '{origen_path.name}' resultó vacía o no existe. "
                 f"El original no fue eliminado."
             )
 
-        # Paso 5: borrar el original solo si la copia es válida
         origen_path.unlink()
-
         return destino_path
 
     except Exception as e:
-        # Limpiar copia parcial si algo salió mal en el paso 3 o 4
         if destino_path.exists():
             destino_path.unlink()
         raise RuntimeError(
